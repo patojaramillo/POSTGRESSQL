@@ -1,0 +1,195 @@
+with reapplications as (
+    select
+        user_reapplying.user_id,
+        user_count,
+        substr(notable_loan_applications.address_hash,1,5)as address_hash
+    from
+        notable_loan_applications
+        inner join (
+            select
+                distinct user_id,
+                loan_application_id
+            from
+                notable_loans
+            where
+                notable_loans.withdrawal_reason LIKE 'USER_REAPPLYING%'
+                and origination_date is not null
+        ) User_reapplying on notable_loan_applications._id = user_reapplying.loan_application_id
+        inner join (
+            select
+                notable_loans.user_id,
+                count(notable_loans.user_id) as user_count,
+                substr(address_hash,1,5) as address_hash
+            from
+                notable_loan_applications
+                inner join notable_loans on notable_loan_applications._id = notable_loans.loan_application_id
+            where
+                origination_date is not null
+            group by
+                notable_loans.user_id,
+                substr(notable_loan_applications.address_hash,1,5)
+            having
+                count(notable_loans.user_id) > 1
+        ) User_count on user_reapplying.user_id = user_count.user_id
+        and substr(notable_loan_applications.address_hash,1,5) = substr(user_count.address_hash,1,5)
+    order by
+        user_count desc
+),
+reapplications_expired as (
+    select
+        count(notable_loan_applications.user_id) as user_count,
+        notable_loan_applications.user_id,
+        substr(notable_loan_applications.address_hash,1,5) as address_hash
+    from
+        notable_loan_applications
+        inner join notable_loans on notable_loan_applications._id = notable_loans.loan_application_id
+        inner join (
+            select
+                notable_loan_applications.user_id,
+                substr(notable_loan_applications.address_hash,1,5) as address_hash
+            from
+                notable_loan_applications
+                inner join notable_loans on notable_loan_applications._id = notable_loans.loan_application_id
+            where
+                notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is not null
+        ) expired_loans on notable_loan_applications.user_id = expired_loans.user_id
+        and substr(notable_loan_applications.address_hash,1,5) = substr(expired_loans.address_hash,1,5)
+    where
+        notable_loans.origination_date is not null
+    group by
+        notable_loan_applications.user_id,
+        substr(notable_loan_applications.address_hash,1,5)
+    having
+        count(notable_loan_applications.user_id) > 1
+    order by
+        2 desc
+),
+expired_accounts as( 
+    select
+    notable_loans.user_id,
+    min(notable_loans.authorized_at) as original_authorized_at
+    from 
+    notable_loans
+    where notable_loans.status='EXPIRED'
+    and notable_loans.origination_date is not null
+    group by notable_loans.user_id
+)  
+select
+    distinct notable_loans.user_id as user_id,
+    notable_loan_applications._id as loan_application_id,
+    notable_loans.slug as loan_id,
+    upper(
+        concat(
+            notable_users.first_name,
+            ' ',
+            notable_users.last_name
+        )
+    ) as borrower_name,
+    notable_loan_applications.listing_address_line1 as listing_address_line1,
+    notable_users.state as home_state,
+    case
+        when notable_loans.is_ach_only = TRUE THEN 'ACH'
+        else 'CARD'
+    end as loan_type,
+    notable_loans.status as current_status,
+    notable_loans.portfolio as facility,
+    notable_loans.principal as loan_amount,
+    notable_loans.authorized_at as billable_date,
+    reapplication_rules,
+    reapplication_results,
+    notable_loans.program,
+    test_account,
+    billable_account
+from
+    notable_loan_applications
+    left join notable_loans on notable_loan_applications._id = notable_loans.loan_application_id
+    left join notable_users on notable_loans.user_id = notable_users._id
+    left join reapplications on notable_loan_applications.user_id = reapplications.user_id
+    and substr(notable_loan_applications.address_hash,1,5) = reapplications.address_hash
+    left join reapplications_expired on notable_loan_applications.user_id = reapplications_expired.user_id
+     left join expired_accounts on notable_loans.user_id=expired_accounts.user_id
+    and substr(notable_loan_applications.address_hash,1,5)  = reapplications_expired.address_hash,
+    lateral (
+        select
+            case
+                when reapplications.user_id is not null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is not null then 'REAPP_ORIGINAL_RULE1'
+                when reapplications_expired.user_id is not null
+                and reapplications.user_id is null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is not null then 'REAPP_ORIGINAL_RULE2'
+                when reapplications.user_id is not null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is null then 'REAPP_ORIGINAL_no_date'
+                when reapplications.user_id is null
+                and reapplications_expired.user_id is not null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is null then 'REAPP_ORIGINAL_no_date_expired'
+                when reapplications.user_id is not null THEN 'REAPP_NEW_RULE1'
+                
+                when reapplications.user_id is null
+                and reapplications_expired.user_id is not null THEN 'REAPP_NEW_RULE2'
+                else 'FALSE'
+            end as reapplication_rules
+    ) as reapp_rules,
+    lateral (
+        select
+            case
+                /*when reapplications.user_id is not null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is not null then 'FALSE'
+               
+                when reapplications_expired.user_id is not null
+                and reapplications.user_id is null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is not null then 'FALSE'*/
+               
+                when reapplications.user_id is not null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is null then 'FALSE'
+               
+                when reapplications.user_id is null
+                and reapplications_expired.user_id is not null
+                and notable_loans.status = 'EXPIRED'
+                and notable_loans.origination_date is null then 'FALSE'
+               
+                when reapplications.user_id is not null THEN 'REAPP'
+                
+                when reapplications.user_id is null
+                and reapplications_expired.user_id is not null THEN 'REAPP'
+                else 'FALSE'
+            end as reapplication_results
+    ) as reapp_combination,
+    lateral (
+        select
+            case
+                when notable_loan_applications.compass_agent_id in ('5d88c801bdcfcf8eb90753a7') then TRUE
+                else FALSE
+            end as test_account
+    ) as test_account_logic
+ ,lateral ( 
+    select 
+        case 
+            when (notable_loans.user_id=expired_accounts.user_id and notable_loans.authorized_at=expired_accounts.original_authorized_at) then 'Billable_loan' 
+                else 'FALSE' 
+            end as billable_account
+    ) as billable_account_logic    
+where
+    notable_loans.authorized_at is not null
+     [[and notable_loan_applications.state::varchar = ({{State}})]]
+     [[and notable_loans.principal >= {{loanAmount_min}} and notable_loans.principal <={{loanAmount_max}}]]
+     [[and notable_loans.authorized_at >= {{start_date_inclusive}}]]
+     [[and notable_loans.authorized_at <= {{end_date_inclusive}}]]
+     [[and (notable_loans.status)::varchar={{Status}}]]
+     [[and (reapplication_results)::varchar ={{reapplication}}]]
+     [[and (test_account)::varchar={{test_account}}]]
+     [[and (notable_loans.program)::varchar={{partner_program}}]]
+     [[and (notable_users._id){{user_id}}]]
+     and notable_users._id not in ('5d8cc54945e1880016e52454',
+'5da3df10ce53830016a61cb4',
+'5db21915771edc0016fe4341',
+'5de5e7adef75720016e4cffe')
+order by notable_loans.user_id asc
+     ;
